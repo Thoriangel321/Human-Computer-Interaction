@@ -1,0 +1,28 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  background-color: #050510; /* Глибокий космос */
+  color: #00ff00; /* Термінальний зелений для HUD */
+  font-family: monospace;
+}
+
+canvas {
+  display: block;
+  width: 100vw;
+  height: 100vh;
+}
+
+#hud {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  pointer-events: none;
+  background: rgba(0, 0, 0, 0.7);
+  padding: 10px;
+  border: 1px solid #333;
+}
