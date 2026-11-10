@@ -1,4 +1,0 @@
-[
-  { "id": "room1", "name": "Alpha Sector", "players": 1, "maxPlayers": 4 },
-  { "id": "room2", "name": "Asteroid Belt", "players": 3, "maxPlayers": 8 }
-]
