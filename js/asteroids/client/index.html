@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Space Game - Lab 1</title>
+    <link rel="stylesheet" href="/style.css">
+  </head>
+  <body>
+    <div id="error-overlay" style="display: none; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); text-align: center; font-family: monospace; color: red;">
+      <h2>Failed to load assets</h2>
+      <p id="error-message"></p>
+      <button id="retry-btn" style="padding: 10px 20px; cursor: pointer; background: #222; color: #0f0; border: 1px solid #0f0;">Retry</button>
+    </div>
+    <!-- canvas itself -->
+    <canvas id="game-canvas"></canvas>
+    
+    <!-- HUD for beautiful thing to see -->
+    <div id="hud">
+      <div id="fps">FPS: 0</div>
+      <div id="tps">Steps/s: 0</div>
+      <div id="frame-time">Frame time: 0ms</div>
+      <div id="score">Score: 0</div>
+    </div>
+    
+    <div id="lobby-screen" style="position: absolute; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(5,5,16,0.95); color: #00ffcc; font-family: monospace; display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 50;">
+      
+      <h1 style="font-size: 40px; margin-bottom: 20px;">SPACE ARENA</h1>
+      
+      <div style="margin-bottom: 20px;">
+        <label>Player Name: </label>
+        <input type="text" id="player-name-input" value="Pilot1" style="background: #111; color: #00ffcc; border: 1px solid #00ffcc; padding: 5px;">
+      </div>
+
+      <div style="border: 1px solid #333; padding: 10px; width: 300px; margin-bottom: 20px;">
+        <h3>Available Rooms</h3>
+        <ul id="rooms-list" style="list-style: none; padding: 0; margin: 0;">
+          <!-- Кімнати генеруватимуться сюди -->
+          <li>Loading rooms...</li>
+        </ul>
+      </div>
+
+      <button id="join-btn" disabled style="padding: 10px 20px; cursor: pointer; background: #222; color: #555; border: 1px solid #555; font-size: 18px;">
+        JOIN GAME
+      </button>
+    </div>
+    
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
