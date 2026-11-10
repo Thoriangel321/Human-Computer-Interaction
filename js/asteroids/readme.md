@@ -41,4 +41,14 @@ We use `npm workspaces` to manage `client` and `server` in a single monorepo, al
 
 
 
+## Lab 5: Authoritative Server, Client-Side Prediction & Binary Protocol
 
+A netcode engine for a multiplayer space game built with Node.js and WebSockets.
+
+## 🚀 Main Features
+- **Authoritative Server:** The server fully simulates world physics and broadcasts state snapshots to players. The client only sends inputs (keys).
+- **Client-Side Prediction (CSP) & Reconciliation:** The client instantly predicts its ship's movement locally, and upon receiving a server snapshot, smoothly corrects discrepancies without delays or stuttering.
+- **Binary Protocol (`DataView` / `ArrayBuffer`):** Instead of heavy text JSON, data is packed into compact bytes (little-endian), saving up to 85% of bandwidth.
+- **Netgraph:** A real-time developer panel showing ping (RTT), traffic volume (Bytes/s), and positioning error magnitude.
+
+---
