@@ -1,3 +1,0 @@
-{"ts":"2026-11-15T22:41:17.930Z","payload":{"event":"room_created","roomId":"room2","seed":264785513}}
-{"ts":"2026-11-15T22:41:18.028Z","payload":{"event":"player_joined","playerId":1,"playerName":"Penis"}}
-{"ts":"2026-11-15T22:41:18.050Z","payload":{"event":"player_left","playerId":1,"playerName":"Penis"}}
