@@ -6,9 +6,16 @@ import { initAudio, playLaserSound } from './audio.js';
 import { getAudioContext, type LoadedAssets } from './assets.js';
 import { Lobby } from './lobby.js';
 import { GameSocket, type IncomingSocketPayload } from './network.js';
-import { World, type SnapshotEntity } from '../../shared/world.js';
-import { Asteroid, Bullet, Ship, type GameEntity, type InputKeys } from '../../shared/entity.js';
-import { Vector2 } from '../../shared/math.js';
+import { ParticleSystem } from './particlePool.js';
+import { FrameProfiler } from './profiler.js';
+import {
+  reconcileShipState,
+  World,
+  type PendingInputEntry,
+  type SnapshotEntity
+} from '../../shared/world.js';
+import { Asteroid, Bullet, Ship, type GameEntity } from '../../shared/entity.js';
+import { MutableVector2 } from '../../shared/math.js';
 import { PRNG } from '../../shared/random.js';
 import {
   packInput,
@@ -22,11 +29,6 @@ import {
   type EntityId,
   type InputSeq
 } from '../../shared/types.js';
-
-interface PendingInput {
-  readonly seq: InputSeq;
-  readonly keys: InputKeys;
-}
 
 interface TimedSnapshot {
   readonly receivedAt: number;
@@ -44,10 +46,35 @@ function getRequiredElement(id: string): HTMLElement {
   return el;
 }
 
-const canvasEl = document.getElementById('game-canvas');
-if (!(canvasEl instanceof HTMLCanvasElement)) {
-  throw new Error('Required canvas #game-canvas not found');
+function getRequiredCanvas(id: string): HTMLCanvasElement {
+  const el = document.getElementById(id);
+  if (!(el instanceof HTMLCanvasElement)) {
+    throw new Error(`Required canvas #${id} not found`);
+  }
+  return el;
 }
+
+function getRequiredInput(id: string): HTMLInputElement {
+  const el = document.getElementById(id);
+  if (!(el instanceof HTMLInputElement)) {
+    throw new Error(`Required input #${id} not found`);
+  }
+  return el;
+}
+
+function getRequiredButton(id: string): HTMLButtonElement {
+  const el = document.getElementById(id);
+  if (!(el instanceof HTMLButtonElement)) {
+    throw new Error(`Required button #${id} not found`);
+  }
+  return el;
+}
+
+const canvasEl = getRequiredCanvas('game-canvas');
+const chatInputEl = getRequiredInput('chat-input');
+const chatSendEl = getRequiredButton('chat-send');
+const btnBotsEl = getRequiredButton('btn-bots');
+const btnProfileEl = getRequiredButton('btn-profile');
 
 const gameContainerEl = getRequiredElement('game-container');
 const netgraphEl = getRequiredElement('netgraph');
@@ -56,6 +83,9 @@ const ngAgeEl = getRequiredElement('ng-age');
 const ngBpsEl = getRequiredElement('ng-bps');
 const ngQueueEl = getRequiredElement('ng-queue');
 const ngErrEl = getRequiredElement('ng-err');
+const ngP99El = getRequiredElement('ng-p99');
+const profileReportEl = getRequiredElement('profile-report');
+const chatMessagesEl = getRequiredElement('chat-messages');
 const errorOverlayEl = getRequiredElement('error-overlay');
 const errorMessageEl = getRequiredElement('error-message');
 
@@ -64,23 +94,32 @@ const renderer = createRenderer(canvasEl);
 const bounds = renderer.getBounds();
 
 const world = new World(bounds.width, bounds.height);
+const particles = new ParticleSystem(256);
+const profiler = new FrameProfiler(3600);
+
 export let globalAssets: LoadedAssets | null = null;
 export let deterministicRng: PRNG | null = null;
 
+let currentRoomId = 'room1';
 let socket: GameSocket | null = null;
 let myPlayerId: EntityId | null = null;
 let myShip: Ship | null = null;
-let myPrevPos = new Vector2(bounds.width / 2, bounds.height / 2);
+const myPrevPos = new MutableVector2(bounds.width / 2, bounds.height / 2);
 let myPrevAngle = -Math.PI / 2;
 let isJoined = false;
 let hasReceivedInitialSpawn = false;
 
 let inputSeq: InputSeq = toInputSeq(0);
-let pendingInputs: PendingInput[] = [];
-let posError = new Vector2(0, 0);
+let pendingInputs: PendingInputEntry[] = [];
+const posError = new MutableVector2(0, 0);
 let localFireCooldown = 0;
 
 const snapshotBuffer: TimedSnapshot[] = [];
+const activeIdsScratch = new Set<EntityId>();
+
+// 8 клієнтських ботів, які шлють реальні пакети input
+const botSockets: GameSocket[] = [];
+let botTimer: ReturnType<typeof setInterval> | null = null;
 
 // Метрики Netgraph
 let bytesReceived = 0;
@@ -102,12 +141,95 @@ window.addEventListener('keydown', unlockAudio, { once: true });
 setInterval(() => {
   ngBpsEl.textContent = String(bytesReceived);
   bytesReceived = 0;
+  const stats = profiler.computePercentiles();
+  ngP99El.textContent = stats.p99.toFixed(1);
 }, 1000);
+
+function appendChatMessage(text: string): void {
+  const line = document.createElement('div');
+  line.textContent = text;
+  chatMessagesEl.appendChild(line);
+  chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
+}
+
+function sendChatFromInput(): void {
+  const text = chatInputEl.value.trim();
+  if (text.length === 0 || socket === null) return;
+  socket.sendJson({ type: 'chat', text });
+  chatInputEl.value = '';
+}
+
+chatSendEl.addEventListener('click', sendChatFromInput);
+chatInputEl.addEventListener('keydown', (e: KeyboardEvent) => {
+  e.stopPropagation();
+  if (e.key === 'Enter') {
+    sendChatFromInput();
+  }
+});
+
+function toggleBots(): void {
+  if (botSockets.length > 0) {
+    if (botTimer !== null) {
+      clearInterval(botTimer);
+      botTimer = null;
+    }
+    for (const bot of botSockets) {
+      bot.disconnect();
+    }
+    botSockets.length = 0;
+    btnBotsEl.textContent = 'Bots: OFF';
+    return;
+  }
+
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const wsUrl = `${protocol}//${window.location.host}/ws`;
+
+  for (let i = 0; i < 8; i++) {
+    const bot = new GameSocket(wsUrl);
+    bot.setHandlers({
+      onOpen: () => {
+        bot.sendJson({ type: 'join', roomId: currentRoomId, playerName: `Bot-${i + 1}` });
+      }
+    });
+    bot.connect();
+    botSockets.push(bot);
+  }
+
+  let botSeq = 1;
+  botTimer = setInterval(() => {
+    const seq = toInputSeq(botSeq++);
+    for (let i = 0; i < botSockets.length; i++) {
+      const bot = botSockets[i];
+      if (bot === undefined) continue;
+      const phase = (botSeq + i * 9) % 60;
+      bot.sendBinary(
+        packInput(seq, {
+          up: phase < 38,
+          left: phase >= 10 && phase < 25,
+          right: phase >= 35 && phase < 50,
+          space: phase % 18 === 0
+        })
+      );
+    }
+  }, 1000 / 30);
+
+  btnBotsEl.textContent = 'Bots: 8 ON';
+}
+
+btnBotsEl.addEventListener('click', toggleBots);
+
+btnProfileEl.addEventListener('click', () => {
+  if (profiler.active) return;
+  profiler.startSession(30000);
+  btnProfileEl.textContent = 'Recording...';
+  profileReportEl.textContent = 'Recording 30s frame times...';
+});
 
 const lobby = new Lobby();
 lobby.show();
 
 lobby.onJoin(({ roomId, playerName }) => {
+  currentRoomId = roomId;
   lobby.hide();
   gameContainerEl.style.display = 'block';
   void boot(roomId, playerName);
@@ -163,40 +285,37 @@ async function handleServerPayload(payload: IncomingSocketPayload): Promise<void
     }
 
     const entityMap = new Map<EntityId, SnapshotEntity>();
-    for (const s of msg.state) {
+    for (let i = 0; i < msg.state.length; i++) {
+      const s = msg.state[i];
+      if (s === undefined) continue;
       entityMap.set(s.id, s);
 
       if (myPlayerId !== null && s.id === myPlayerId && myShip !== null) {
         const beforeX = myShip.pos.x;
         const beforeY = myShip.pos.y;
 
-        myShip.pos = new Vector2(s.x, s.y);
-        myShip.vel = new Vector2(s.vx, s.vy);
-        myShip.angle = s.a;
-
-        const serverLastSeq = msg.lastSeq;
-        pendingInputs = pendingInputs.filter((inp) => inp.seq > serverLastSeq);
-
-        for (const pending of pendingInputs) {
-          myShip.applyInput(pending.keys, FIXED_DT);
-          myShip.update(FIXED_DT);
-          clampShipToBounds(myShip);
-        }
+        pendingInputs = reconcileShipState(
+          myShip,
+          s,
+          msg.lastSeq,
+          pendingInputs,
+          bounds,
+          FIXED_DT
+        );
 
         if (!hasReceivedInitialSpawn) {
           hasReceivedInitialSpawn = true;
-          myPrevPos = myShip.pos;
+          myPrevPos.copyFrom(myShip.pos);
           myPrevAngle = myShip.angle;
-          posError = new Vector2(0, 0);
+          posError.set(0, 0);
         } else {
           const dx = beforeX - myShip.pos.x;
           const dy = beforeY - myShip.pos.y;
-          // Великий стрибок (наприклад, респавн після знищення) застосовуємо одразу
           if (Math.hypot(dx, dy) > 120) {
-            posError = new Vector2(0, 0);
-            myPrevPos = myShip.pos;
+            posError.set(0, 0);
+            myPrevPos.copyFrom(myShip.pos);
           } else {
-            posError = new Vector2(posError.x + dx, posError.y + dy);
+            posError.set(posError.x + dx, posError.y + dy);
           }
         }
       }
@@ -226,7 +345,7 @@ async function handleServerPayload(payload: IncomingSocketPayload): Promise<void
 
       const ship = new Ship(msg.playerId, msg.bounds.width / 2, msg.bounds.height / 2);
       myShip = ship;
-      myPrevPos = ship.pos;
+      myPrevPos.copyFrom(ship.pos);
       myPrevAngle = ship.angle;
       world.spawn(ship);
 
@@ -236,10 +355,10 @@ async function handleServerPayload(payload: IncomingSocketPayload): Promise<void
       break;
     }
     case 'system':
-      console.log(`[System] ${msg.text}`);
+      appendChatMessage(`[System] ${msg.text}`);
       break;
     case 'chat':
-      console.log(`[Chat] ${msg.playerName}: ${msg.text}`);
+      appendChatMessage(`${msg.playerName}: ${msg.text}`);
       break;
     default:
       assertNever(msg);
@@ -247,26 +366,16 @@ async function handleServerPayload(payload: IncomingSocketPayload): Promise<void
 }
 
 function clampShipToBounds(ship: Ship): void {
-  let nx = ship.pos.x;
-  let ny = ship.pos.y;
-  let vx = ship.vel.x;
-  let vy = ship.vel.y;
-
-  if (nx < ship.radius) { nx = ship.radius; vx = 0; }
-  if (nx > bounds.width - ship.radius) { nx = bounds.width - ship.radius; vx = 0; }
-  if (ny < ship.radius) { ny = ship.radius; vy = 0; }
-  if (ny > bounds.height - ship.radius) { ny = bounds.height - ship.radius; vy = 0; }
-
-  if (nx !== ship.pos.x || ny !== ship.pos.y || vx !== ship.vel.x || vy !== ship.vel.y) {
-    ship.pos = new Vector2(nx, ny);
-    ship.vel = new Vector2(vx, vy);
-  }
+  if (ship.pos.x < ship.radius) { ship.pos.x = ship.radius; ship.vel.x = 0; }
+  if (ship.pos.x > bounds.width - ship.radius) { ship.pos.x = bounds.width - ship.radius; ship.vel.x = 0; }
+  if (ship.pos.y < ship.radius) { ship.pos.y = ship.radius; ship.vel.y = 0; }
+  if (ship.pos.y > bounds.height - ship.radius) { ship.pos.y = bounds.height - ship.radius; ship.vel.y = 0; }
 }
 
 function stepLocalPrediction(): void {
   if (!isJoined || myShip === null || socket === null) return;
 
-  myPrevPos = myShip.pos;
+  myPrevPos.copyFrom(myShip.pos);
   myPrevAngle = myShip.angle;
 
   const keys = input.readKeys();
@@ -281,9 +390,22 @@ function stepLocalPrediction(): void {
     playLaserSound();
   }
 
-  const currentInput: PendingInput = { seq: inputSeq, keys };
+  if (keys.up) {
+    const exhaustX = myShip.pos.x - Math.cos(myShip.angle) * 14;
+    const exhaustY = myShip.pos.y - Math.sin(myShip.angle) * 14;
+    particles.emit(
+      exhaustX,
+      exhaustY,
+      -Math.cos(myShip.angle) * 70,
+      -Math.sin(myShip.angle) * 70,
+      0.25,
+      3,
+      '#facc15'
+    );
+  }
+
   socket.sendBinary(packInput(inputSeq, keys));
-  pendingInputs.push(currentInput);
+  pendingInputs.push({ seq: inputSeq, keys });
 
   myShip.applyInput(keys, FIXED_DT);
   myShip.update(FIXED_DT);
@@ -302,7 +424,6 @@ function updateRemoteEntities(now: number): void {
 
   const renderTime = now - INTERPOLATION_DELAY_MS;
 
-  // Видаляємо застарілі знімки, залишаючи принаймні один перед renderTime
   while (snapshotBuffer.length >= 2) {
     const second = snapshotBuffer[1];
     if (second !== undefined && second.receivedAt <= renderTime) {
@@ -322,11 +443,11 @@ function updateRemoteEntities(now: number): void {
   }
 
   const activeSource = s1 ?? s0;
-  const activeIds = new Set<EntityId>();
+  activeIdsScratch.clear();
 
   for (const [id, snap1] of activeSource.entities.entries()) {
     if (myPlayerId !== null && id === myPlayerId) continue;
-    activeIds.add(id);
+    activeIdsScratch.add(id);
 
     const snap0 = s0.entities.get(id);
     let x = snap1.x;
@@ -351,7 +472,7 @@ function updateRemoteEntities(now: number): void {
           created = new Asteroid(snap1.id, x, y, snap1.radius);
           break;
         case 'bullet':
-          created = new Bullet(snap1.id, toEntityId(0), x, y, a, new Vector2(0, 0));
+          created = new Bullet(snap1.id, toEntityId(0), x, y, a, myPrevPos);
           break;
         default:
           return assertNever(snap1);
@@ -360,19 +481,20 @@ function updateRemoteEntities(now: number): void {
       world.spawn(entity);
     }
 
-    entity.pos = new Vector2(x, y);
+    entity.pos.set(x, y);
     entity.angle = a;
   }
 
   for (const id of world.entities.keys()) {
     if (myPlayerId !== null && id === myPlayerId) continue;
-    if (!activeIds.has(id)) {
+    if (!activeIdsScratch.has(id)) {
       world.remove(id);
     }
   }
 }
 
 function renderLoop(now: number): void {
+  const frameStart = performance.now();
   const frameDt = Math.min(0.1, (now - lastFrameTime) / 1000);
   lastFrameTime = now;
   accumulator += frameDt;
@@ -385,36 +507,50 @@ function renderLoop(now: number): void {
   const alpha = accumulator / FIXED_DT;
 
   updateRemoteEntities(now);
+  particles.update(frameDt);
 
   let errX = posError.x * 0.85;
   let errY = posError.y * 0.85;
   if (Math.abs(errX) < 0.05) errX = 0;
   if (Math.abs(errY) < 0.05) errY = 0;
-  posError = new Vector2(errX, errY);
+  posError.set(errX, errY);
 
-  let savedPos: Vector2 | null = null;
+  let savedPosX = 0;
+  let savedPosY = 0;
   let savedAngle = 0;
 
   if (myShip !== null) {
-    savedPos = myShip.pos;
+    savedPosX = myShip.pos.x;
+    savedPosY = myShip.pos.y;
     savedAngle = myShip.angle;
 
-    const interpX = myPrevPos.x + (savedPos.x - myPrevPos.x) * alpha + posError.x;
-    const interpY = myPrevPos.y + (savedPos.y - myPrevPos.y) * alpha + posError.y;
+    const interpX = myPrevPos.x + (savedPosX - myPrevPos.x) * alpha + posError.x;
+    const interpY = myPrevPos.y + (savedPosY - myPrevPos.y) * alpha + posError.y;
     const interpA = interpolateAngle(myPrevAngle, savedAngle, alpha);
 
-    myShip.pos = new Vector2(interpX, interpY);
+    myShip.pos.set(interpX, interpY);
     myShip.angle = interpA;
   }
 
   ngQueueEl.textContent = String(pendingInputs.length);
   ngErrEl.textContent = posError.length().toFixed(1);
 
-  renderer.render(world, myPlayerId);
+  renderer.render(world, myPlayerId, particles);
 
-  if (myShip !== null && savedPos !== null) {
-    myShip.pos = savedPos;
+  if (myShip !== null) {
+    myShip.pos.set(savedPosX, savedPosY);
     myShip.angle = savedAngle;
+  }
+
+  const frameCostMs = performance.now() - frameStart;
+  const finishedSession = profiler.recordFrame(frameCostMs, now);
+  if (finishedSession) {
+    const stats = profiler.computePercentiles();
+    btnProfileEl.textContent = 'Profile 30s';
+    profileReportEl.textContent =
+      `30s (${stats.count} frames):\n` +
+      `p50=${stats.p50}ms | p95=${stats.p95}ms | p99=${stats.p99}ms\n` +
+      `Pool reused: ${particles.pool.totalReused}`;
   }
 
   requestAnimationFrame(renderLoop);

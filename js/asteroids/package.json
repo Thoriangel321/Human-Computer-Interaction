@@ -8,15 +8,30 @@
   ],
   "scripts": {
     "typecheck": "npm run typecheck --workspace=shared && npm run typecheck --workspace=server && npm run typecheck --workspace=client",
-    "build:shared": "npm run build --workspace=shared",
+    "lint": "eslint shared server client/src tests scripts",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "build": "npm run build --workspace=client",
+    "test:e2e": "playwright test",
     "dev:server": "npm run dev --workspace=server",
-    "dev:client": "npm run dev --workspace=client"
+    "dev:client": "npm run dev --workspace=client",
+    "bench:load": "tsx scripts/load-test.ts"
   },
   "devDependencies": {
+    "@eslint/js": "^9.12.0",
+    "@playwright/test": "^1.48.0",
     "@types/node": "^22.0.0",
-    "typescript": "^5.6.0"
+    "@vitest/coverage-v8": "^2.1.2",
+    "eslint": "^9.12.0",
+    "fast-check": "^3.22.0",
+    "jsdom": "^25.0.1",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "typescript-eslint": "^8.8.0",
+    "vitest": "^2.1.2"
   },
   "dependencies": {
+    "ws": "^8.18.0",
     "zod": "^3.23.8"
   }
 }

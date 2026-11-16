@@ -1,7 +1,7 @@
-import { Vector2 } from './math.js';
+import { MutableVector2, Vector2, type Vec2Like } from './math.js';
 
 export interface CircleBody {
-  readonly pos: Vector2;
+  readonly pos: Vec2Like;
   readonly radius: number;
 }
 
@@ -22,15 +22,49 @@ export function resolveCirclePush(
   obstacle: CircleBody,
   padding = 2
 ): CollisionPushResult | null {
-  const delta = mover.pos.sub(obstacle.pos);
-  const dist = delta.length();
+  const dx = mover.pos.x - obstacle.pos.x;
+  const dy = mover.pos.y - obstacle.pos.y;
+  const dist = Math.hypot(dx, dy);
   const minDist = mover.radius + obstacle.radius;
 
   if (dist >= minDist || dist <= 0.0001) {
     return null;
   }
 
-  const normal = delta.scale(1 / dist);
-  const pos = obstacle.pos.add(normal.scale(minDist + padding));
-  return { pos, normal };
+  const nx = dx / dist;
+  const ny = dy / dist;
+  return {
+    pos: new Vector2(
+      obstacle.pos.x + nx * (minDist + padding),
+      obstacle.pos.y + ny * (minDist + padding)
+    ),
+    normal: new Vector2(nx, ny)
+  };
+}
+
+export function applyCirclePushInPlace(
+  moverPos: MutableVector2,
+  moverVel: MutableVector2,
+  moverRadius: number,
+  obstacle: CircleBody,
+  bounceSpeed = 140,
+  padding = 2
+): boolean {
+  const dx = moverPos.x - obstacle.pos.x;
+  const dy = moverPos.y - obstacle.pos.y;
+  const dist = Math.hypot(dx, dy);
+  const minDist = moverRadius + obstacle.radius;
+
+  if (dist >= minDist || dist <= 0.0001) {
+    return false;
+  }
+
+  const nx = dx / dist;
+  const ny = dy / dist;
+  moverPos.set(
+    obstacle.pos.x + nx * (minDist + padding),
+    obstacle.pos.y + ny * (minDist + padding)
+  );
+  moverVel.set(nx * bounceSpeed, ny * bounceSpeed);
+  return true;
 }

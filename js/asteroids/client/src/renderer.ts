@@ -1,10 +1,11 @@
 import type { World, WorldBounds } from '../../shared/world.js';
 import type { Asteroid, Bullet, GameEntity, Ship } from '../../shared/entity.js';
+import type { ParticleSystem } from './particlePool.js';
 import { assertNever, type EntityId } from '../../shared/types.js';
 
 export interface Renderer {
   getBounds(): WorldBounds;
-  render(world: World, myPlayerId: EntityId | null): void;
+  render(world: World, myPlayerId: EntityId | null, particles?: ParticleSystem): void;
 }
 
 export function createRenderer(canvas: HTMLCanvasElement): Renderer {
@@ -121,7 +122,7 @@ export function createRenderer(canvas: HTMLCanvasElement): Renderer {
     getBounds(): WorldBounds {
       return bounds;
     },
-    render(world: World, myPlayerId: EntityId | null): void {
+    render(world: World, myPlayerId: EntityId | null, particles?: ParticleSystem): void {
       ctx.fillStyle = '#030712';
       ctx.fillRect(0, 0, bounds.width, bounds.height);
 
@@ -139,6 +140,17 @@ export function createRenderer(canvas: HTMLCanvasElement): Renderer {
         ctx.moveTo(0, y);
         ctx.lineTo(bounds.width, y);
         ctx.stroke();
+      }
+
+      if (particles !== undefined) {
+        for (let i = 0; i < particles.activeParticles.length; i++) {
+          const p = particles.activeParticles[i];
+          if (p === undefined || !p.active) continue;
+          ctx.globalAlpha = Math.max(0, p.life / p.maxLife);
+          ctx.fillStyle = p.color;
+          ctx.fillRect(p.x - p.size * 0.5, p.y - p.size * 0.5, p.size, p.size);
+        }
+        ctx.globalAlpha = 1;
       }
 
       for (const entity of world.entities.values()) {

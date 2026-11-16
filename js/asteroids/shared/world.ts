@@ -1,8 +1,10 @@
-import { Vector2 } from './math.js';
-import { Asteroid, Bullet, Ship, type GameEntity } from './entity.js';
-import { circlesOverlap, resolveCirclePush } from './collision.js';
+import { MutableVector2 } from './math.js';
+import { Asteroid, Bullet, Ship, type GameEntity, type InputKeys } from './entity.js';
+import { applyCirclePushInPlace, circlesOverlap } from './collision.js';
+import { ObjectPool } from './pool.js';
+import { SpatialHash } from './spatialHash.js';
 import { PRNG } from './random.js';
-import { assertNever, toTick, type EntityId, type Tick } from './types.js';
+import { assertNever, toEntityId, toTick, type EntityId, type InputSeq, type Tick } from './types.js';
 
 export interface WorldBounds {
   readonly width: number;
@@ -46,13 +48,24 @@ export type SnapshotEntity = ShipSnapshot | AsteroidSnapshot | BulletSnapshot;
 
 export type IdAllocator = () => EntityId;
 
+export interface PendingInputEntry {
+  readonly seq: InputSeq;
+  readonly keys: InputKeys;
+}
+
+const ZERO_VEL = new MutableVector2(0, 0);
+
 export class World {
   public readonly bounds: WorldBounds;
   public readonly entities: Map<EntityId, GameEntity>;
+  public readonly bulletPool: ObjectPool<Bullet>;
+  public readonly spatialHash: SpatialHash<GameEntity>;
+  public useSpatialHash = true;
   public tick: Tick;
 
   private readonly allocateId: IdAllocator | null;
   private readonly rng: PRNG | null;
+  private readonly queryBuffer: GameEntity[] = [];
 
   constructor(
     width: number,
@@ -65,14 +78,31 @@ export class World {
     this.tick = toTick(0);
     this.allocateId = allocateId;
     this.rng = rng;
+    this.spatialHash = new SpatialHash<GameEntity>(80);
+
+    this.bulletPool = new ObjectPool<Bullet>(
+      () => new Bullet(toEntityId(0), toEntityId(0), 0, 0, 0, ZERO_VEL),
+      (bullet) => {
+        bullet.isDead = true;
+        bullet.ttl = 0;
+      },
+      64
+    );
   }
 
   public spawn(entity: GameEntity): void {
-    this.entities.set(entity.id, entity);
+    const key = entity.kind === 'bullet' ? entity.mutableId : entity.id;
+    this.entities.set(key, entity);
   }
 
   public remove(id: EntityId): void {
-    this.entities.delete(id);
+    const existing = this.entities.get(id);
+    if (existing !== undefined) {
+      this.entities.delete(id);
+      if (existing.kind === 'bullet') {
+        this.bulletPool.release(existing);
+      }
+    }
   }
 
   public tryFireBullet(ship: Ship): Bullet | null {
@@ -85,15 +115,17 @@ export class World {
     const bx = ship.pos.x + Math.cos(ship.angle) * noseOffset;
     const by = ship.pos.y + Math.sin(ship.angle) * noseOffset;
 
-    const bullet = new Bullet(this.allocateId(), ship.id, bx, by, ship.angle, ship.vel);
-    this.spawn(bullet);
+    const bulletId = this.allocateId();
+    const bullet = this.bulletPool.acquire();
+    bullet.reset(bulletId, ship.id, bx, by, ship.angle, ship.vel);
+    this.entities.set(bulletId, bullet);
     return bullet;
   }
 
   public step(dt: number): void {
     this.tick = toTick(this.tick + 1);
 
-    // 1. Оновлення позицій та меж арени
+    // 1. Оновлення позицій та меж арени (zero-allocation)
     for (const entity of this.entities.values()) {
       entity.update(dt);
 
@@ -127,86 +159,126 @@ export class World {
           assertNever(entity);
       }
 
-      if (nx !== entity.pos.x || ny !== entity.pos.y || vx !== entity.vel.x || vy !== entity.vel.y) {
-        entity.pos = new Vector2(nx, ny);
-        entity.vel = new Vector2(vx, vy);
+      if (nx !== entity.pos.x || ny !== entity.pos.y) {
+        entity.pos.set(nx, ny);
+      }
+      if (vx !== entity.vel.x || vy !== entity.vel.y) {
+        entity.vel.set(vx, vy);
       }
     }
 
-    // 2. Колізії (виконуються тільки на авторитетному боці з allocateId)
+    // 2. Колізії (авторитетна симуляція)
     if (this.allocateId !== null) {
-      this.resolveCollisions();
+      if (this.useSpatialHash) {
+        this.resolveCollisionsSpatial();
+      } else {
+        this.resolveCollisionsBruteForce();
+      }
     }
 
-    // 3. Видалення знищених сутностей
+    // 3. Видалення знищених сутностей та повернення куль у пул
     for (const [id, entity] of this.entities.entries()) {
       if (entity.isDead) {
         this.entities.delete(id);
+        if (entity.kind === 'bullet') {
+          this.bulletPool.release(entity);
+        }
       }
     }
   }
 
-  private resolveCollisions(): void {
-    const ships: Ship[] = [];
-    const asteroids: Asteroid[] = [];
-    const bullets: Bullet[] = [];
+  private resolveCollisionsSpatial(): void {
+    this.spatialHash.clear();
+    for (const entity of this.entities.values()) {
+      if (!entity.isDead) {
+        this.spatialHash.insert(entity);
+      }
+    }
 
     for (const entity of this.entities.values()) {
       if (entity.isDead) continue;
-      switch (entity.kind) {
-        case 'ship':
-          ships.push(entity);
-          break;
-        case 'asteroid':
-          asteroids.push(entity);
-          break;
-        case 'bullet':
-          bullets.push(entity);
-          break;
-        default:
-          assertNever(entity);
-      }
-    }
 
-    // Кулі проти астероїдів та чужих кораблів
-    for (const bullet of bullets) {
-      if (bullet.isDead) continue;
+      if (entity.kind === 'bullet') {
+        const candidates = this.spatialHash.query(
+          entity.pos.x,
+          entity.pos.y,
+          entity.radius + 36,
+          this.queryBuffer
+        );
 
-      for (const asteroid of asteroids) {
-        if (asteroid.isDead) continue;
-        if (circlesOverlap(bullet, asteroid)) {
-          bullet.isDead = true;
-          asteroid.isDead = true;
-          this.handleAsteroidDestroyed(asteroid);
-          break;
-        }
-      }
+        for (let i = 0; i < candidates.length; i++) {
+          const target = candidates[i];
+          if (target === undefined || target.isDead || target === entity) continue;
 
-      if (bullet.isDead) continue;
-
-      for (const ship of ships) {
-        if (ship.isDead || ship.id === bullet.ownerId) continue;
-        if (circlesOverlap(bullet, ship)) {
-          bullet.isDead = true;
-          ship.hp -= 25;
-          if (ship.hp <= 0) {
-            this.respawnShip(ship);
+          if (target.kind === 'asteroid' && circlesOverlap(entity, target)) {
+            entity.isDead = true;
+            target.isDead = true;
+            this.handleAsteroidDestroyed(target);
+            break;
           }
-          break;
+
+          if (target.kind === 'ship' && target.id !== entity.ownerId && circlesOverlap(entity, target)) {
+            entity.isDead = true;
+            target.hp -= 25;
+            if (target.hp <= 0) {
+              this.respawnShip(target);
+            }
+            break;
+          }
+        }
+      } else if (entity.kind === 'ship') {
+        const candidates = this.spatialHash.query(
+          entity.pos.x,
+          entity.pos.y,
+          entity.radius + 36,
+          this.queryBuffer
+        );
+
+        for (let i = 0; i < candidates.length; i++) {
+          const target = candidates[i];
+          if (target === undefined || target.isDead || target.kind !== 'asteroid') continue;
+
+          if (applyCirclePushInPlace(entity.pos, entity.vel, entity.radius, target, 140, 2)) {
+            target.isDead = true;
+            this.handleAsteroidDestroyed(target);
+          }
         }
       }
     }
+  }
 
-    // Кораблі проти астероїдів
-    for (const ship of ships) {
-      for (const asteroid of asteroids) {
-        if (asteroid.isDead) continue;
-        const push = resolveCirclePush(ship, asteroid, 2);
-        if (push !== null) {
-          ship.pos = push.pos;
-          ship.vel = push.normal.scale(140);
-          asteroid.isDead = true;
-          this.handleAsteroidDestroyed(asteroid);
+  private resolveCollisionsBruteForce(): void {
+    for (const entity of this.entities.values()) {
+      if (entity.isDead) continue;
+
+      if (entity.kind === 'bullet') {
+        for (const target of this.entities.values()) {
+          if (target.isDead || target === entity) continue;
+
+          if (target.kind === 'asteroid' && circlesOverlap(entity, target)) {
+            entity.isDead = true;
+            target.isDead = true;
+            this.handleAsteroidDestroyed(target);
+            break;
+          }
+
+          if (target.kind === 'ship' && target.id !== entity.ownerId && circlesOverlap(entity, target)) {
+            entity.isDead = true;
+            target.hp -= 25;
+            if (target.hp <= 0) {
+              this.respawnShip(target);
+            }
+            break;
+          }
+        }
+      } else if (entity.kind === 'ship') {
+        for (const target of this.entities.values()) {
+          if (target.isDead || target.kind !== 'asteroid') continue;
+
+          if (applyCirclePushInPlace(entity.pos, entity.vel, entity.radius, target, 140, 2)) {
+            target.isDead = true;
+            this.handleAsteroidDestroyed(target);
+          }
         }
       }
     }
@@ -221,7 +293,7 @@ export class World {
         const child = new Asteroid(this.allocateId(), asteroid.pos.x, asteroid.pos.y, childRadius);
         const angle = this.rng.range(0, Math.PI * 2);
         const speed = this.rng.range(55, 110);
-        child.vel = new Vector2(Math.cos(angle) * speed, Math.sin(angle) * speed);
+        child.vel.set(Math.cos(angle) * speed, Math.sin(angle) * speed);
         child.angle = angle;
         this.spawn(child);
       }
@@ -256,7 +328,7 @@ export class World {
       const fresh = new Asteroid(this.allocateId(), x, y, radius);
       const angle = this.rng.range(0, Math.PI * 2);
       const speed = this.rng.range(30, 70);
-      fresh.vel = new Vector2(Math.cos(angle) * speed, Math.sin(angle) * speed);
+      fresh.vel.set(Math.cos(angle) * speed, Math.sin(angle) * speed);
       fresh.angle = angle;
       this.spawn(fresh);
     }
@@ -266,17 +338,18 @@ export class World {
     ship.hp = 100;
     const x = this.rng ? this.rng.range(120, this.bounds.width - 120) : this.bounds.width / 2;
     const y = this.rng ? this.rng.range(120, this.bounds.height - 120) : this.bounds.height / 2;
-    ship.pos = new Vector2(x, y);
-    ship.vel = new Vector2(0, 0);
+    ship.pos.set(x, y);
+    ship.vel.set(0, 0);
   }
 
   public createSnapshot(): readonly SnapshotEntity[] {
     const state: SnapshotEntity[] = [];
     for (const e of this.entities.values()) {
       if (e.isDead) continue;
+      const entityId = e.kind === 'bullet' ? e.mutableId : e.id;
       state.push({
         kind: e.kind,
-        id: e.id,
+        id: entityId,
         x: e.pos.x,
         y: e.pos.y,
         vx: e.vel.x,
@@ -287,4 +360,36 @@ export class World {
     }
     return state;
   }
+}
+
+/**
+ * Детермінована звірка локального корабля з авторитетним знімком сервера (Server Reconciliation).
+ */
+export function reconcileShipState(
+  ship: Ship,
+  serverState: SnapshotEntity,
+  serverLastSeq: InputSeq,
+  pendingInputs: readonly PendingInputEntry[],
+  bounds: WorldBounds,
+  dt: number
+): PendingInputEntry[] {
+  ship.pos.set(serverState.x, serverState.y);
+  ship.vel.set(serverState.vx, serverState.vy);
+  ship.angle = serverState.a;
+
+  const remaining = pendingInputs.filter((inp) => inp.seq > serverLastSeq);
+
+  for (let i = 0; i < remaining.length; i++) {
+    const pending = remaining[i];
+    if (pending === undefined) continue;
+    ship.applyInput(pending.keys, dt);
+    ship.update(dt);
+
+    if (ship.pos.x < ship.radius) { ship.pos.x = ship.radius; ship.vel.x = 0; }
+    if (ship.pos.x > bounds.width - ship.radius) { ship.pos.x = bounds.width - ship.radius; ship.vel.x = 0; }
+    if (ship.pos.y < ship.radius) { ship.pos.y = ship.radius; ship.vel.y = 0; }
+    if (ship.pos.y > bounds.height - ship.radius) { ship.pos.y = bounds.height - ship.radius; ship.vel.y = 0; }
+  }
+
+  return remaining;
 }

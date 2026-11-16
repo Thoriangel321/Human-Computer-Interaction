@@ -1,177 +1,141 @@
-import { WebSocketServer, WebSocket, type RawData } from 'ws';
-import { Room, type RoomSummary } from './room.js';
-import { parseClientMessage, unpackInput } from '../shared/protocol.js';
+import type { Server as HttpServer } from 'node:http';
+import { WebSocket, WebSocketServer, type RawData } from 'ws';
+import { Room } from './room.js';
+import { RateLimiter } from './rateLimiter.js';
+import {
+  parseClientMessage,
+  unpackInput,
+  USE_BINARY
+} from '../shared/protocol.js';
 import { assertNever, toInputSeq } from '../shared/types.js';
 
-export const rooms = new Map<string, Room>();
-
-export function createRoom(id: string, name: string, maxPlayers: number): Room {
-  const room = new Room(id, name, maxPlayers);
-  room.on('empty', (roomId: string) => {
-    console.log(`[Room] Room "${roomId}" is empty and removed.`);
-    rooms.delete(roomId);
-  });
-  rooms.set(id, room);
-  return room;
+interface AliveWebSocket extends WebSocket {
+  isAlive?: boolean;
+  clientKey?: string;
 }
 
-export function getRoomSummaries(): RoomSummary[] {
-  const list: RoomSummary[] = [];
+function findRoomByClient(rooms: Map<string, Room>, ws: WebSocket): Room | null {
   for (const room of rooms.values()) {
-    list.push(room.getSummary());
+    if (room.hasClient(ws)) return room;
   }
-  return list;
+  return null;
 }
 
-createRoom('room1', 'Node.js Arena', 4);
-createRoom('room2', 'Asteroid Belt', 8);
-
-interface SocketConnectionState {
-  isAlive: boolean;
-  missedPongs: number;
-  roomId: string | null;
-  msgCount: number;
-}
-
-function normalizeRawData(data: RawData): Buffer | ArrayBuffer {
+function rawDataToUint8Array(data: RawData): Uint8Array | null {
+  if (Buffer.isBuffer(data)) {
+    return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  }
+  if (data instanceof ArrayBuffer) {
+    return new Uint8Array(data);
+  }
   if (Array.isArray(data)) {
-    return Buffer.concat(data);
+    const merged = Buffer.concat(data);
+    return new Uint8Array(merged.buffer, merged.byteOffset, merged.byteLength);
   }
-  return data;
+  return null;
 }
 
-export function setupWebSocket(wss: WebSocketServer): void {
-  const connectionStates = new Map<WebSocket, SocketConnectionState>();
+export function attachWebSocket(server: HttpServer, rooms: Map<string, Room>): WebSocketServer {
+  const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 1024 });
+  const rateLimiter = new RateLimiter(90, 60);
+  let nextClientSeq = 1;
 
-  const pingInterval = setInterval(() => {
+  const heartbeat = setInterval(() => {
     for (const ws of wss.clients) {
-      const state = connectionStates.get(ws);
-      if (!state) continue;
-
-      if (!state.isAlive) {
-        state.missedPongs += 1;
-        if (state.missedPongs >= 2) {
-          ws.terminate();
-          continue;
-        }
+      const client = ws as AliveWebSocket;
+      if (client.isAlive === false) {
+        client.terminate();
+        continue;
       }
-      state.isAlive = false;
-      ws.ping();
+      client.isAlive = false;
+      client.ping();
     }
   }, 15000);
 
   wss.on('close', () => {
-    clearInterval(pingInterval);
+    clearInterval(heartbeat);
   });
 
-  wss.on('connection', (ws: WebSocket) => {
-    const connState: SocketConnectionState = {
-      isAlive: true,
-      missedPongs: 0,
-      roomId: null,
-      msgCount: 0
-    };
-    connectionStates.set(ws, connState);
+  wss.on('connection', (ws: AliveWebSocket) => {
+    const clientKey = `client-${nextClientSeq++}`;
+    ws.isAlive = true;
+    ws.clientKey = clientKey;
 
     ws.on('pong', () => {
-      connState.isAlive = true;
-      connState.missedPongs = 0;
+      ws.isAlive = true;
     });
 
-    const rateLimitInterval = setInterval(() => {
-      connState.msgCount = 0;
-    }, 1000);
-
     ws.on('close', () => {
-      clearInterval(rateLimitInterval);
-      connectionStates.delete(ws);
+      rateLimiter.remove(clientKey);
     });
 
     ws.on('message', (data: RawData, isBinary: boolean) => {
-      connState.msgCount += 1;
-      if (connState.msgCount > 45) {
-        ws.close(4029, 'Rate limit exceeded');
+      if (!rateLimiter.allow(clientKey)) {
         return;
       }
 
-      const normalized = normalizeRawData(data);
-
       if (isBinary) {
-        const decoded = unpackInput(normalized);
+        if (!USE_BINARY) return;
+
+        const bytes = rawDataToUint8Array(data);
+        if (bytes === null) return;
+
+        const decoded = unpackInput(bytes);
         if (!decoded.ok) {
           console.warn(`[WS] Invalid binary packet: ${decoded.error}`);
-          ws.close(1007, 'Invalid binary protocol packet');
           return;
         }
 
-        if (connState.roomId === null) return;
-        const room = rooms.get(connState.roomId);
-        if (room) {
+        const room = findRoomByClient(rooms, ws);
+        if (room !== null) {
           room.handleInput(ws, decoded.data.seq, decoded.data.keys);
         }
         return;
       }
 
-      const byteLength =
-        normalized instanceof ArrayBuffer ? normalized.byteLength : normalized.length;
-      if (byteLength > 2048) {
-        ws.close(1009, 'Message too big');
-        return;
-      }
+      const bytes = rawDataToUint8Array(data);
+      if (bytes === null) return;
 
-      const parsed = parseClientMessage(normalized);
+      const parsed = parseClientMessage(bytes);
       if (!parsed.ok) {
         console.warn(`[WS] Invalid client JSON message: ${parsed.error}`);
-        ws.close(1007, 'Invalid message format');
         return;
       }
 
       const msg = parsed.data;
+
       switch (msg.type) {
         case 'join': {
-          if (connState.roomId !== null) return;
-
           let room = rooms.get(msg.roomId);
-          if (!room && (msg.roomId === 'room1' || msg.roomId === 'room2')) {
-            room = createRoom(
-              msg.roomId,
-              msg.roomId === 'room1' ? 'Node.js Arena' : 'Asteroid Belt',
-              msg.roomId === 'room1' ? 4 : 8
-            );
+          if (room === undefined) {
+            room = new Room(msg.roomId, `Room ${msg.roomId}`, 256);
+            rooms.set(msg.roomId, room);
           }
 
-          if (!room) {
-            ws.close(4004, 'Room not found');
-            return;
-          }
-
-          if (room.addClient(ws, msg.playerName)) {
-            connState.roomId = room.id;
+          if (!room.hasClient(ws)) {
+            room.addClient(ws, msg.playerName);
           }
           break;
         }
-
         case 'chat': {
-          if (connState.roomId === null) return;
-          const room = rooms.get(connState.roomId);
-          if (room) {
+          const room = findRoomByClient(rooms, ws);
+          if (room !== null) {
             room.handleChat(ws, msg.text);
           }
           break;
         }
-
         case 'input': {
-          if (connState.roomId === null) return;
-          const room = rooms.get(connState.roomId);
-          if (room) {
+          const room = findRoomByClient(rooms, ws);
+          if (room !== null) {
             room.handleInput(ws, toInputSeq(msg.seq), msg.keys);
           }
           break;
         }
-
         default:
-          return assertNever(msg);
+          assertNever(msg);
       }
     });
   });
+
+  return wss;
 }

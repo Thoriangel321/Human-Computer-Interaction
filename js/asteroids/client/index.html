@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Space Game — TypeScript Netcode</title>
+  <title>Space Game — Performance & Testing</title>
 </head>
 <body>
   <div id="lobby" class="lobby-container">
@@ -18,12 +18,26 @@
     <canvas id="game-canvas" width="800" height="600"></canvas>
 
     <div id="netgraph" class="netgraph">
-      <b>NETGRAPH (TS + Binary)</b>
+      <b>NETGRAPH (Zero-Alloc TS)</b>
       <div>RTT: <span id="ng-rtt">0</span> ms</div>
       <div>Age: <span id="ng-age">0</span> ms</div>
       <div>Bytes/s: <span id="ng-bps">0</span></div>
       <div>In Queue: <span id="ng-queue">0</span></div>
       <div>Pos Error: <span id="ng-err">0</span> px</div>
+      <div>Frame p99: <span id="ng-p99">0.0</span> ms</div>
+      <div class="hud-actions">
+        <button id="btn-bots" type="button">Bots: OFF</button>
+        <button id="btn-profile" type="button">Profile 30s</button>
+      </div>
+      <div id="profile-report" class="profile-report"></div>
+    </div>
+
+    <div id="chat-box" class="chat-box">
+      <div id="chat-messages" class="chat-messages"></div>
+      <div class="chat-input-row">
+        <input type="text" id="chat-input" placeholder="Message..." maxlength="160" />
+        <button id="chat-send" type="button">Send</button>
+      </div>
     </div>
 
     <div id="error-overlay" class="error-overlay" style="display: none;">

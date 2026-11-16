@@ -1,11 +1,11 @@
 import { EventEmitter } from 'node:events';
+import { performance } from 'node:perf_hooks';
 import { WebSocket } from 'ws';
 import { MatchLogger } from './logger.js';
 import { createServerLoop, type ServerLoop } from './loop.js';
 import { config } from './config.js';
 import { World } from '../shared/world.js';
 import { Asteroid, Ship, type InputKeys } from '../shared/entity.js';
-import { Vector2 } from '../shared/math.js';
 import { PRNG } from '../shared/random.js';
 import { packSnapshot, type ServerJsonMessage } from '../shared/protocol.js';
 import { toEntityId, toInputSeq, type EntityId, type InputSeq } from '../shared/types.js';
@@ -21,6 +21,16 @@ export interface RoomSummary {
   readonly name: string;
   readonly players: number;
   readonly maxPlayers: number;
+}
+
+export interface RoomStepMetrics {
+  readonly roomId: string;
+  readonly players: number;
+  readonly entities: number;
+  readonly lastStepMs: number;
+  readonly avgStepMs: number;
+  readonly maxStepMs: number;
+  readonly useSpatialHash: boolean;
 }
 
 interface QueuedInput {
@@ -43,13 +53,18 @@ export class Room extends EventEmitter<RoomEvents> {
   public readonly name: string;
   public readonly maxPlayers: number;
   public readonly logger: MatchLogger;
+  public readonly world: World;
 
   private readonly sessions = new Map<WebSocket, ClientSession>();
-  private readonly world: World;
   private readonly seed: number;
   private readonly random: PRNG;
   private readonly loop: ServerLoop;
   private nextEntityId = 1;
+
+  private lastStepMs = 0;
+  private maxStepMs = 0;
+  private stepSamples = 0;
+  private stepSumMs = 0;
 
   constructor(id: string, name: string, maxPlayers: number) {
     super();
@@ -84,7 +99,7 @@ export class Room extends EventEmitter<RoomEvents> {
 
       const angle = this.random.range(0, Math.PI * 2);
       const speed = this.random.range(30, 75);
-      asteroid.vel = new Vector2(Math.cos(angle) * speed, Math.sin(angle) * speed);
+      asteroid.vel.set(Math.cos(angle) * speed, Math.sin(angle) * speed);
       asteroid.angle = angle;
 
       this.world.spawn(asteroid);
@@ -102,6 +117,25 @@ export class Room extends EventEmitter<RoomEvents> {
       players: this.sessions.size,
       maxPlayers: this.maxPlayers
     };
+  }
+
+  public getStepMetrics(): RoomStepMetrics {
+    return {
+      roomId: this.id,
+      players: this.sessions.size,
+      entities: this.world.entities.size,
+      lastStepMs: Number(this.lastStepMs.toFixed(3)),
+      avgStepMs: this.stepSamples > 0 ? Number((this.stepSumMs / this.stepSamples).toFixed(3)) : 0,
+      maxStepMs: Number(this.maxStepMs.toFixed(3)),
+      useSpatialHash: this.world.useSpatialHash
+    };
+  }
+
+  public resetStepMetrics(): void {
+    this.lastStepMs = 0;
+    this.maxStepMs = 0;
+    this.stepSamples = 0;
+    this.stepSumMs = 0;
   }
 
   public hasClient(ws: WebSocket): boolean {
@@ -189,7 +223,7 @@ export class Room extends EventEmitter<RoomEvents> {
   }
 
   public handleInput(ws: WebSocket, seq: InputSeq, keys: InputKeys): void {
-    setTimeout(() => {
+    const enqueue = (): void => {
       const session = this.sessions.get(ws);
       if (!session) return;
       if (seq <= session.lastSeq && session.inputQueue.length === 0) return;
@@ -197,7 +231,13 @@ export class Room extends EventEmitter<RoomEvents> {
       if (session.inputQueue.length < 16) {
         session.inputQueue.push({ seq, keys });
       }
-    }, config.SIMULATED_LAG_MS);
+    };
+
+    if (config.SIMULATED_LAG_MS <= 0) {
+      enqueue();
+    } else {
+      setTimeout(enqueue, config.SIMULATED_LAG_MS);
+    }
   }
 
   public handleChat(ws: WebSocket, text: string): void {
@@ -213,7 +253,9 @@ export class Room extends EventEmitter<RoomEvents> {
     this.broadcastJson(chatMsg);
   }
 
-  private tick(dt: number): void {
+  public stepSimulation(dt: number): void {
+    const t0 = performance.now();
+
     for (const session of this.sessions.values()) {
       const nextInput = session.inputQueue.shift();
       let keysToApply: InputKeys | null = null;
@@ -249,14 +291,33 @@ export class Room extends EventEmitter<RoomEvents> {
 
     for (const session of this.sessions.values()) {
       if (session.ws.readyState !== WebSocket.OPEN) continue;
-      if (session.ws.bufferedAmount > 16384) continue;
+      if (session.ws.bufferedAmount > 65536) continue;
 
       const snapshotBuffer = packSnapshot(session.lastSeq, this.world.tick, state);
       this.sendWithLag(session.ws, snapshotBuffer);
     }
+
+    const elapsed = performance.now() - t0;
+    this.lastStepMs = elapsed;
+    this.stepSumMs += elapsed;
+    this.stepSamples += 1;
+    if (elapsed > this.maxStepMs) {
+      this.maxStepMs = elapsed;
+    }
+  }
+
+  private tick(dt: number): void {
+    this.stepSimulation(dt);
   }
 
   private sendWithLag(ws: WebSocket, payload: string | ArrayBuffer): void {
+    if (config.SIMULATED_LAG_MS <= 0) {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(payload);
+      }
+      return;
+    }
+
     setTimeout(() => {
       if (ws.readyState === WebSocket.OPEN) {
         ws.send(payload);
