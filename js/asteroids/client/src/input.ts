@@ -1,24 +1,34 @@
 import type { InputKeys } from '../../shared/entity.js';
 
 export interface InputController {
-  isPressed(code: string): boolean;
   readKeys(): InputKeys;
+  setTouchKey(key: keyof InputKeys, pressed: boolean): void;
   destroy(): void;
 }
 
 export function createInput(): InputController {
   const pressed = new Set<string>();
-
-  const onKeyDown = (e: KeyboardEvent): void => {
-    pressed.add(e.code);
+  const touchState = {
+    up: false,
+    left: false,
+    right: false,
+    space: false
   };
 
-  const onKeyUp = (e: KeyboardEvent): void => {
-    pressed.delete(e.code);
+  const onKeyDown = (event: KeyboardEvent): void => {
+    pressed.add(event.code);
+  };
+
+  const onKeyUp = (event: KeyboardEvent): void => {
+    pressed.delete(event.code);
   };
 
   const onBlur = (): void => {
     pressed.clear();
+    touchState.up = false;
+    touchState.left = false;
+    touchState.right = false;
+    touchState.space = false;
   };
 
   window.addEventListener('keydown', onKeyDown);
@@ -26,16 +36,16 @@ export function createInput(): InputController {
   window.addEventListener('blur', onBlur);
 
   return {
-    isPressed(code: string): boolean {
-      return pressed.has(code);
-    },
     readKeys(): InputKeys {
       return {
-        up: pressed.has('KeyW') || pressed.has('ArrowUp'),
-        left: pressed.has('KeyA') || pressed.has('ArrowLeft'),
-        right: pressed.has('KeyD') || pressed.has('ArrowRight'),
-        space: pressed.has('Space')
+        up: touchState.up || pressed.has('ArrowUp') || pressed.has('KeyW'),
+        left: touchState.left || pressed.has('ArrowLeft') || pressed.has('KeyA'),
+        right: touchState.right || pressed.has('ArrowRight') || pressed.has('KeyD'),
+        space: touchState.space || pressed.has('Space')
       };
+    },
+    setTouchKey(key: keyof InputKeys, isPressed: boolean): void {
+      touchState[key] = isPressed;
     },
     destroy(): void {
       window.removeEventListener('keydown', onKeyDown);

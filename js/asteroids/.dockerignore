@@ -1,0 +1,8 @@
+node_modules
+dist
+client/dist
+logs
+*.ndjson
+.git
+.github
+.env

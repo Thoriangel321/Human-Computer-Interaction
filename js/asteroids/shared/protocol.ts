@@ -2,7 +2,6 @@ import { z } from 'zod';
 import type { InputKeys } from './entity.js';
 import type { SnapshotEntity, WorldBounds } from './world.js';
 import {
-  assertNever,
   toEntityId,
   toInputSeq,
   toTick,
@@ -11,78 +10,88 @@ import {
   type Tick
 } from './types.js';
 
-export const USE_BINARY = true;
 export const PROTOCOL_VERSION = 1;
+export const USE_BINARY = true;
 
-const MSG_INPUT = 1;
-const MSG_SNAPSHOT = 2;
-const INPUT_PACKET_SIZE = 7;
-const SNAPSHOT_HEADER_SIZE = 12; // 1 ver + 1 type + 4 lastSeq + 4 tick + 2 count
-const SNAPSHOT_ENTITY_SIZE = 22; // 2 id + 1 kind + 1 radius + 4 x + 4 y + 4 vx + 4 vy + 2 angle
-const MAX_ENTITIES_PER_SNAPSHOT = 512;
+export const MSG_TYPE = {
+  INPUT: 1,
+  SNAPSHOT: 2
+} as const;
 
-// --- ZOD СХЕМИ ПОВІДОМЛЕНЬ ---
+export const ENTITY_KIND = {
+  ship: 1,
+  asteroid: 2,
+  bullet: 3
+} as const;
 
-export const InputKeysSchema = z.object({
+export type DecodeResult<T> =
+  | { readonly ok: true; readonly data: T }
+  | { readonly ok: false; readonly error: string };
+
+const inputKeysSchema = z.object({
   up: z.boolean(),
   left: z.boolean(),
   right: z.boolean(),
   space: z.boolean()
-});
+}).strict();
 
-export const JoinMessageSchema = z.object({
+const joinMessageSchema = z.object({
   type: z.literal('join'),
-  roomId: z.string().min(1).max(32),
+  roomId: z.string().trim().min(1).max(32),
   playerName: z.string().trim().min(1).max(20)
-});
+}).strict();
 
-export const ChatMessageSchema = z.object({
+const chatMessageSchema = z.object({
   type: z.literal('chat'),
-  text: z.string().trim().min(1).max(200)
-});
+  text: z.string().trim().min(1).max(160)
+}).strict();
 
-export const InputJsonMessageSchema = z.object({
+const clientInputJsonSchema = z.object({
   type: z.literal('input'),
   seq: z.number().int().nonnegative(),
-  keys: InputKeysSchema
-});
+  keys: inputKeysSchema
+}).strict();
 
-export const ClientMessageSchema = z.discriminatedUnion('type', [
-  JoinMessageSchema,
-  ChatMessageSchema,
-  InputJsonMessageSchema
+export const clientMessageSchema = z.discriminatedUnion('type', [
+  joinMessageSchema,
+  chatMessageSchema,
+  clientInputJsonSchema
 ]);
 
-export type JoinMessage = z.infer<typeof JoinMessageSchema>;
-export type ChatMessage = z.infer<typeof ChatMessageSchema>;
-export type ClientMessage = z.infer<typeof ClientMessageSchema>;
+export type ClientMessage = z.infer<typeof clientMessageSchema>;
 
-export const ServerJoinedSchema = z.object({
+const serverJoinedSchema = z.object({
   type: z.literal('joined'),
-  roomId: z.string(),
-  playerId: z.number().int().positive(),
+  roomId: z.string().min(1),
+  playerId: z.number().int().positive().transform(toEntityId),
   seed: z.number().int(),
   bounds: z.object({
     width: z.number().positive(),
     height: z.number().positive()
-  })
-});
+  }).strict()
+}).strict();
 
-export const ServerSystemSchema = z.object({
+const serverSystemSchema = z.object({
   type: z.literal('system'),
-  text: z.string()
-});
+  text: z.string().min(1)
+}).strict();
 
-export const ServerChatSchema = z.object({
+const serverChatSchema = z.object({
   type: z.literal('chat'),
-  playerName: z.string(),
-  text: z.string()
-});
+  playerName: z.string().min(1),
+  text: z.string().min(1)
+}).strict();
 
-export const ServerJsonMessageSchema = z.discriminatedUnion('type', [
-  ServerJoinedSchema,
-  ServerSystemSchema,
-  ServerChatSchema
+const serverShutdownSchema = z.object({
+  type: z.literal('shutdown'),
+  reason: z.string().min(1)
+}).strict();
+
+export const serverJsonMessageSchema = z.discriminatedUnion('type', [
+  serverJoinedSchema,
+  serverSystemSchema,
+  serverChatSchema,
+  serverShutdownSchema
 ]);
 
 export type ServerJsonMessage =
@@ -93,124 +102,92 @@ export type ServerJsonMessage =
       readonly seed: number;
       readonly bounds: WorldBounds;
     }
-  | z.infer<typeof ServerSystemSchema>
-  | z.infer<typeof ServerChatSchema>;
+  | {
+      readonly type: 'system';
+      readonly text: string;
+    }
+  | {
+      readonly type: 'chat';
+      readonly playerName: string;
+      readonly text: string;
+    }
+  | {
+      readonly type: 'shutdown';
+      readonly reason: string;
+    };
 
-export type ParseResult<T> =
-  | { readonly ok: true; readonly data: T }
-  | { readonly ok: false; readonly error: string };
-
-export function parseClientMessage(raw: unknown): ParseResult<ClientMessage> {
+function decodeRawJson(raw: unknown): DecodeResult<unknown> {
   let text: string;
-
   if (typeof raw === 'string') {
     text = raw;
   } else if (raw instanceof Uint8Array) {
     text = new TextDecoder().decode(raw);
+  } else if (raw instanceof ArrayBuffer) {
+    text = new TextDecoder().decode(new Uint8Array(raw));
   } else {
-    return { ok: false, error: 'Payload is not a string or Uint8Array' };
+    return { ok: false, error: 'Unsupported message payload type' };
   }
 
-  let parsedJson: unknown;
   try {
-    parsedJson = JSON.parse(text);
+    return { ok: true, data: JSON.parse(text) as unknown };
   } catch {
     return { ok: false, error: 'Malformed JSON syntax' };
   }
-
-  const result = ClientMessageSchema.safeParse(parsedJson);
-  if (!result.success) {
-    return {
-      ok: false,
-      error: `Schema validation failed: ${result.error.issues.map((i) => i.message).join(', ')}`
-    };
-  }
-
-  return { ok: true, data: result.data };
 }
 
-export function parseServerJsonMessage(raw: unknown): ParseResult<ServerJsonMessage> {
-  if (typeof raw !== 'string') {
-    return { ok: false, error: 'Expected string JSON from server' };
-  }
+export function parseClientMessage(raw: unknown): DecodeResult<ClientMessage> {
+  const jsonResult = decodeRawJson(raw);
+  if (!jsonResult.ok) return jsonResult;
 
-  let parsedJson: unknown;
-  try {
-    parsedJson = JSON.parse(raw);
-  } catch {
-    return { ok: false, error: 'Malformed server JSON' };
+  const parsed = clientMessageSchema.safeParse(jsonResult.data);
+  if (!parsed.success) {
+    return { ok: false, error: parsed.error.issues[0]?.message ?? 'Invalid client message' };
   }
-
-  const result = ServerJsonMessageSchema.safeParse(parsedJson);
-  if (!result.success) {
-    return { ok: false, error: 'Invalid server message structure' };
-  }
-
-  const msg = result.data;
-  switch (msg.type) {
-    case 'joined':
-      return {
-        ok: true,
-        data: {
-          type: 'joined',
-          roomId: msg.roomId,
-          playerId: toEntityId(msg.playerId),
-          seed: msg.seed,
-          bounds: msg.bounds
-        }
-      };
-    case 'system':
-    case 'chat':
-      return { ok: true, data: msg };
-    default:
-      return assertNever(msg);
-  }
+  return { ok: true, data: parsed.data };
 }
 
-// --- БІНАРНИЙ ПРОТОКОЛ (DataView, little-endian) ---
+export function parseServerJsonMessage(raw: unknown): DecodeResult<ServerJsonMessage> {
+  const jsonResult = decodeRawJson(raw);
+  if (!jsonResult.ok) return jsonResult;
 
-export interface DecodedInputPacket {
-  readonly type: 'input';
+  const parsed = serverJsonMessageSchema.safeParse(jsonResult.data);
+  if (!parsed.success) {
+    return { ok: false, error: parsed.error.issues[0]?.message ?? 'Invalid server message' };
+  }
+  return { ok: true, data: parsed.data };
+}
+
+export function packInput(seq: InputSeq, keys: InputKeys): ArrayBuffer {
+  const buffer = new ArrayBuffer(7);
+  const view = new DataView(buffer);
+
+  view.setUint8(0, PROTOCOL_VERSION);
+  view.setUint8(1, MSG_TYPE.INPUT);
+  view.setUint32(2, seq >>> 0, true);
+
+  let mask = 0;
+  if (keys.up) mask |= 1 << 0;
+  if (keys.left) mask |= 1 << 1;
+  if (keys.right) mask |= 1 << 2;
+  if (keys.space) mask |= 1 << 3;
+  view.setUint8(6, mask);
+
+  return buffer;
+}
+
+export interface UnpackedInput {
   readonly seq: InputSeq;
   readonly keys: InputKeys;
 }
 
-export interface DecodedSnapshotPacket {
-  readonly type: 'snapshot';
-  readonly lastSeq: InputSeq;
-  readonly tick: Tick;
-  readonly state: readonly SnapshotEntity[];
-}
-
-export function packInput(seq: InputSeq, keys: InputKeys): ArrayBuffer {
-  const buf = new ArrayBuffer(INPUT_PACKET_SIZE);
-  const view = new DataView(buf);
-
-  view.setUint8(0, PROTOCOL_VERSION);
-  view.setUint8(1, MSG_INPUT);
-  view.setUint32(2, seq, true);
-
-  let mask = 0;
-  if (keys.up) mask |= 1;
-  if (keys.left) mask |= 2;
-  if (keys.right) mask |= 4;
-  if (keys.space) mask |= 8;
-  view.setUint8(6, mask);
-
-  return buf;
-}
-
-export function unpackInput(data: ArrayBufferView | ArrayBuffer): ParseResult<DecodedInputPacket> {
+export function unpackInput(data: ArrayBuffer | Uint8Array): DecodeResult<UnpackedInput> {
   const view =
-    data instanceof ArrayBuffer
-      ? new DataView(data)
-      : new DataView(data.buffer, data.byteOffset, data.byteLength);
+    data instanceof Uint8Array
+      ? new DataView(data.buffer, data.byteOffset, data.byteLength)
+      : new DataView(data);
 
-  if (view.byteLength !== INPUT_PACKET_SIZE) {
-    return {
-      ok: false,
-      error: `Invalid input packet length: expected ${INPUT_PACKET_SIZE}, got ${view.byteLength}`
-    };
+  if (view.byteLength !== 7) {
+    return { ok: false, error: `Invalid input packet length: ${view.byteLength}` };
   }
 
   const version = view.getUint8(0);
@@ -218,28 +195,27 @@ export function unpackInput(data: ArrayBufferView | ArrayBuffer): ParseResult<De
     return { ok: false, error: `Unsupported protocol version: ${version}` };
   }
 
-  const msgType = view.getUint8(1);
-  if (msgType !== MSG_INPUT) {
-    return { ok: false, error: `Unexpected binary message type: ${msgType}` };
+  const type = view.getUint8(1);
+  if (type !== MSG_TYPE.INPUT) {
+    return { ok: false, error: `Unexpected input message type: ${type}` };
   }
 
-  const seqNum = view.getUint32(2, true);
+  const seq = toInputSeq(view.getUint32(2, true));
   const mask = view.getUint8(6);
 
-  if ((mask & ~0b1111) !== 0) {
+  if ((mask & ~0x0f) !== 0) {
     return { ok: false, error: `Invalid input bitmask: ${mask}` };
   }
 
   return {
     ok: true,
     data: {
-      type: 'input',
-      seq: toInputSeq(seqNum),
+      seq,
       keys: {
-        up: (mask & 1) !== 0,
-        left: (mask & 2) !== 0,
-        right: (mask & 4) !== 0,
-        space: (mask & 8) !== 0
+        up: (mask & (1 << 0)) !== 0,
+        left: (mask & (1 << 1)) !== 0,
+        right: (mask & (1 << 2)) !== 0,
+        space: (mask & (1 << 3)) !== 0
       }
     }
   };
@@ -250,58 +226,58 @@ export function packSnapshot(
   tick: Tick,
   entities: readonly SnapshotEntity[]
 ): ArrayBuffer {
-  const buf = new ArrayBuffer(SNAPSHOT_HEADER_SIZE + entities.length * SNAPSHOT_ENTITY_SIZE);
-  const view = new DataView(buf);
+  const headerSize = 12;
+  const recordSize = 22;
+  const count = Math.min(entities.length, 65535);
+  const buffer = new ArrayBuffer(headerSize + count * recordSize);
+  const view = new DataView(buffer);
 
   view.setUint8(0, PROTOCOL_VERSION);
-  view.setUint8(1, MSG_SNAPSHOT);
-  view.setUint32(2, lastSeq, true);
-  view.setUint32(6, tick, true);
-  view.setUint16(10, entities.length, true);
+  view.setUint8(1, MSG_TYPE.SNAPSHOT);
+  view.setUint32(2, lastSeq >>> 0, true);
+  view.setUint32(6, tick >>> 0, true);
+  view.setUint16(10, count, true);
 
-  let offset = SNAPSHOT_HEADER_SIZE;
-  for (const e of entities) {
+  let offset = headerSize;
+  for (let i = 0; i < count; i++) {
+    const e = entities[i];
+    if (e === undefined) continue;
+
     view.setUint16(offset, e.id, true);
-
-    let kindByte: number;
-    switch (e.kind) {
-      case 'ship':
-        kindByte = 1;
-        break;
-      case 'asteroid':
-        kindByte = 2;
-        break;
-      case 'bullet':
-        kindByte = 3;
-        break;
-      default:
-        assertNever(e);
-    }
-
-    view.setUint8(offset + 2, kindByte);
+    view.setUint8(offset + 2, ENTITY_KIND[e.kind]);
     view.setUint8(offset + 3, Math.max(1, Math.min(255, Math.round(e.radius))));
     view.setFloat32(offset + 4, e.x, true);
     view.setFloat32(offset + 8, e.y, true);
     view.setFloat32(offset + 12, e.vx, true);
     view.setFloat32(offset + 16, e.vy, true);
 
-    const encodedAngle = Math.max(-32768, Math.min(32767, Math.round(e.a * 10000)));
+    const normalizedAngle = Math.atan2(Math.sin(e.a), Math.cos(e.a));
+    const encodedAngle = Math.round((normalizedAngle / Math.PI) * 32767);
     view.setInt16(offset + 20, encodedAngle, true);
 
-    offset += SNAPSHOT_ENTITY_SIZE;
+    offset += recordSize;
   }
 
-  return buf;
+  return buffer;
 }
 
-export function unpackSnapshot(data: ArrayBufferView | ArrayBuffer): ParseResult<DecodedSnapshotPacket> {
-  const view =
-    data instanceof ArrayBuffer
-      ? new DataView(data)
-      : new DataView(data.buffer, data.byteOffset, data.byteLength);
+export interface UnpackedSnapshot {
+  readonly lastSeq: InputSeq;
+  readonly tick: Tick;
+  readonly state: readonly SnapshotEntity[];
+}
 
-  if (view.byteLength < SNAPSHOT_HEADER_SIZE) {
-    return { ok: false, error: 'Snapshot packet shorter than header' };
+export function unpackSnapshot(data: ArrayBuffer | Uint8Array): DecodeResult<UnpackedSnapshot> {
+  const view =
+    data instanceof Uint8Array
+      ? new DataView(data.buffer, data.byteOffset, data.byteLength)
+      : new DataView(data);
+
+  const headerSize = 12;
+  const recordSize = 22;
+
+  if (view.byteLength < headerSize) {
+    return { ok: false, error: `Snapshot too short: ${view.byteLength}` };
   }
 
   const version = view.getUint8(0);
@@ -309,84 +285,64 @@ export function unpackSnapshot(data: ArrayBufferView | ArrayBuffer): ParseResult
     return { ok: false, error: `Unsupported protocol version: ${version}` };
   }
 
-  const msgType = view.getUint8(1);
-  if (msgType !== MSG_SNAPSHOT) {
-    return { ok: false, error: `Unexpected binary message type: ${msgType}` };
+  const type = view.getUint8(1);
+  if (type !== MSG_TYPE.SNAPSHOT) {
+    return { ok: false, error: `Unexpected snapshot message type: ${type}` };
   }
 
   const lastSeq = toInputSeq(view.getUint32(2, true));
   const tick = toTick(view.getUint32(6, true));
   const count = view.getUint16(10, true);
 
-  if (count > MAX_ENTITIES_PER_SNAPSHOT) {
-    return { ok: false, error: `Snapshot entity count exceeds max: ${count}` };
-  }
-
-  const expectedLength = SNAPSHOT_HEADER_SIZE + count * SNAPSHOT_ENTITY_SIZE;
+  const expectedLength = headerSize + count * recordSize;
   if (view.byteLength !== expectedLength) {
     return {
       ok: false,
-      error: `Snapshot byteLength mismatch: expected ${expectedLength}, got ${view.byteLength}`
+      error: `Snapshot length mismatch: expected ${expectedLength}, got ${view.byteLength}`
     };
   }
 
   const state: SnapshotEntity[] = [];
-  let offset = SNAPSHOT_HEADER_SIZE;
+  let offset = headerSize;
 
   for (let i = 0; i < count; i++) {
     const rawId = view.getUint16(offset, true);
     if (rawId === 0) {
-      return { ok: false, error: 'Invalid entity id 0 in snapshot' };
+      return { ok: false, error: 'Entity id 0 is invalid' };
     }
+    const id = toEntityId(rawId);
 
-    const kindByte = view.getUint8(offset + 2);
-    let kind: SnapshotEntity['kind'];
-    if (kindByte === 1) {
-      kind = 'ship';
-    } else if (kindByte === 2) {
-      kind = 'asteroid';
-    } else if (kindByte === 3) {
-      kind = 'bullet';
-    } else {
-      return { ok: false, error: `Unknown entity kind byte: ${kindByte}` };
-    }
-
+    const kindCode = view.getUint8(offset + 2);
     const radius = view.getUint8(offset + 3);
-    if (radius === 0) {
-      return { ok: false, error: 'Invalid entity radius 0 in snapshot' };
-    }
-
     const x = view.getFloat32(offset + 4, true);
     const y = view.getFloat32(offset + 8, true);
     const vx = view.getFloat32(offset + 12, true);
     const vy = view.getFloat32(offset + 16, true);
-    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(vx) || !Number.isFinite(vy)) {
-      return { ok: false, error: 'Non-finite coordinates or velocity in snapshot' };
+    const encodedAngle = view.getInt16(offset + 20, true);
+    const a = (encodedAngle / 32767) * Math.PI;
+
+    if (
+      !Number.isFinite(x) ||
+      !Number.isFinite(y) ||
+      !Number.isFinite(vx) ||
+      !Number.isFinite(vy) ||
+      !Number.isFinite(a)
+    ) {
+      return { ok: false, error: `Non-finite float in entity ${id}` };
     }
 
-    const a = view.getInt16(offset + 20, true) / 10000;
+    if (kindCode === ENTITY_KIND.ship) {
+      state.push({ kind: 'ship', id, x, y, vx, vy, a, radius });
+    } else if (kindCode === ENTITY_KIND.asteroid) {
+      state.push({ kind: 'asteroid', id, x, y, vx, vy, a, radius });
+    } else if (kindCode === ENTITY_KIND.bullet) {
+      state.push({ kind: 'bullet', id, x, y, vx, vy, a, radius });
+    } else {
+      return { ok: false, error: `Unknown entity kind code: ${kindCode}` };
+    }
 
-    state.push({
-      kind,
-      id: toEntityId(rawId),
-      x,
-      y,
-      vx,
-      vy,
-      a,
-      radius
-    });
-
-    offset += SNAPSHOT_ENTITY_SIZE;
+    offset += recordSize;
   }
 
-  return {
-    ok: true,
-    data: {
-      type: 'snapshot',
-      lastSeq,
-      tick,
-      state
-    }
-  };
+  return { ok: true, data: { lastSeq, tick, state } };
 }

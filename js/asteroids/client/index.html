@@ -2,8 +2,12 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Space Game — TypeScript Netcode</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="theme-color" content="#0284c7" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <link rel="icon" href="/icon-192.png" />
+  <title>Space Game</title>
 </head>
 <body>
   <div id="lobby" class="lobby-container">
@@ -18,12 +22,23 @@
     <canvas id="game-canvas" width="800" height="600"></canvas>
 
     <div id="netgraph" class="netgraph">
-      <b>NETGRAPH (TS + Binary)</b>
+      <b>NETGRAPH</b>
       <div>RTT: <span id="ng-rtt">0</span> ms</div>
       <div>Age: <span id="ng-age">0</span> ms</div>
       <div>Bytes/s: <span id="ng-bps">0</span></div>
       <div>In Queue: <span id="ng-queue">0</span></div>
       <div>Pos Error: <span id="ng-err">0</span> px</div>
+    </div>
+
+    <div id="touch-controls" class="touch-controls">
+      <div class="touch-group">
+        <button id="touch-left" type="button">LEFT</button>
+        <button id="touch-right" type="button">RIGHT</button>
+      </div>
+      <div class="touch-group">
+        <button id="touch-up" type="button">THRUST</button>
+        <button id="touch-fire" type="button">FIRE</button>
+      </div>
     </div>
 
     <div id="error-overlay" class="error-overlay" style="display: none;">

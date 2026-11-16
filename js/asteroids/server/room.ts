@@ -1,6 +1,9 @@
 import { EventEmitter } from 'node:events';
+import { performance } from 'node:perf_hooks';
+import type { Logger } from 'pino';
 import { WebSocket } from 'ws';
-import { MatchLogger } from './logger.js';
+import { createPlayerLogger, createRoomLogger } from './logger.js';
+import { metrics } from './metrics.js';
 import { createServerLoop, type ServerLoop } from './loop.js';
 import { config } from './config.js';
 import { World } from '../shared/world.js';
@@ -23,6 +26,11 @@ export interface RoomSummary {
   readonly maxPlayers: number;
 }
 
+export interface RoomStepMetrics {
+  readonly avgStepMs: number;
+  readonly maxStepMs: number;
+}
+
 interface QueuedInput {
   readonly seq: InputSeq;
   readonly keys: InputKeys;
@@ -32,6 +40,7 @@ interface ClientSession {
   readonly ws: WebSocket;
   readonly playerId: EntityId;
   readonly playerName: string;
+  readonly log: Logger;
   readonly ship: Ship;
   readonly inputQueue: QueuedInput[];
   lastKeys: InputKeys | null;
@@ -42,26 +51,30 @@ export class Room extends EventEmitter<RoomEvents> {
   public readonly id: string;
   public readonly name: string;
   public readonly maxPlayers: number;
-  public readonly logger: MatchLogger;
+  public readonly log: Logger;
+  public readonly world: World;
 
   private readonly sessions = new Map<WebSocket, ClientSession>();
-  private readonly world: World;
   private readonly seed: number;
   private readonly random: PRNG;
   private readonly loop: ServerLoop;
   private nextEntityId = 1;
+
+  private stepSumMs = 0;
+  private stepCount = 0;
+  private maxStepMs = 0;
 
   constructor(id: string, name: string, maxPlayers: number) {
     super();
     this.id = id;
     this.name = name;
     this.maxPlayers = maxPlayers;
-    this.logger = new MatchLogger(this.id, config.LOG_DIR);
+    this.log = createRoomLogger(this.id);
 
     this.seed = Math.floor(Math.random() * 2147483647);
     this.random = new PRNG(this.seed);
     this.world = new World(800, 600, () => this.allocateEntityId(), this.random);
-    this.logger.log({ event: 'room_created', roomId: this.id, seed: this.seed });
+    this.log.info({ event: 'room_created', seed: this.seed }, 'Room created');
 
     this.spawnInitialAsteroids(6);
 
@@ -104,6 +117,13 @@ export class Room extends EventEmitter<RoomEvents> {
     };
   }
 
+  public getStepMetrics(): RoomStepMetrics {
+    return {
+      avgStepMs: this.stepCount > 0 ? this.stepSumMs / this.stepCount : 0,
+      maxStepMs: this.maxStepMs
+    };
+  }
+
   public hasClient(ws: WebSocket): boolean {
     return this.sessions.has(ws);
   }
@@ -115,6 +135,7 @@ export class Room extends EventEmitter<RoomEvents> {
     }
 
     const playerId = this.allocateEntityId();
+    const playerLog = createPlayerLogger(this.id, playerId);
     const x = this.random.range(150, 650);
     const y = this.random.range(150, 450);
     const ship = new Ship(playerId, x, y);
@@ -124,6 +145,7 @@ export class Room extends EventEmitter<RoomEvents> {
       ws,
       playerId,
       playerName,
+      log: playerLog,
       ship,
       inputQueue: [],
       lastKeys: null,
@@ -131,7 +153,7 @@ export class Room extends EventEmitter<RoomEvents> {
     };
 
     this.sessions.set(ws, session);
-    this.logger.log({ event: 'player_joined', playerId, playerName });
+    playerLog.info({ event: 'player_joined', playerName }, 'Player joined room');
 
     if (this.sessions.size === 1) {
       this.loop.start();
@@ -167,11 +189,7 @@ export class Room extends EventEmitter<RoomEvents> {
 
     this.sessions.delete(ws);
     this.world.remove(session.playerId);
-    this.logger.log({
-      event: 'player_left',
-      playerId: session.playerId,
-      playerName: session.playerName
-    });
+    session.log.info({ event: 'player_left', playerName: session.playerName }, 'Player left room');
 
     const leftMsg: ServerJsonMessage = {
       type: 'system',
@@ -183,13 +201,15 @@ export class Room extends EventEmitter<RoomEvents> {
 
     if (this.sessions.size === 0) {
       this.loop.stop();
-      this.logger.close();
+      this.stepSumMs = 0;
+      this.stepCount = 0;
+      this.maxStepMs = 0;
       this.emit('empty', this.id);
     }
   }
 
   public handleInput(ws: WebSocket, seq: InputSeq, keys: InputKeys): void {
-    setTimeout(() => {
+    const enqueue = (): void => {
       const session = this.sessions.get(ws);
       if (!session) return;
       if (seq <= session.lastSeq && session.inputQueue.length === 0) return;
@@ -197,14 +217,20 @@ export class Room extends EventEmitter<RoomEvents> {
       if (session.inputQueue.length < 16) {
         session.inputQueue.push({ seq, keys });
       }
-    }, config.SIMULATED_LAG_MS);
+    };
+
+    if (config.SIMULATED_LAG_MS <= 0) {
+      enqueue();
+    } else {
+      setTimeout(enqueue, config.SIMULATED_LAG_MS);
+    }
   }
 
   public handleChat(ws: WebSocket, text: string): void {
     const session = this.sessions.get(ws);
     if (!session) return;
 
-    this.logger.log({ event: 'chat', playerName: session.playerName, text });
+    session.log.info({ event: 'chat', playerName: session.playerName }, 'Chat message');
     const chatMsg: ServerJsonMessage = {
       type: 'chat',
       playerName: session.playerName,
@@ -214,6 +240,8 @@ export class Room extends EventEmitter<RoomEvents> {
   }
 
   private tick(dt: number): void {
+    const t0 = performance.now();
+
     for (const session of this.sessions.values()) {
       const nextInput = session.inputQueue.shift();
       let keysToApply: InputKeys | null = null;
@@ -239,24 +267,33 @@ export class Room extends EventEmitter<RoomEvents> {
     this.world.step(dt);
     const state = this.world.createSnapshot();
 
-    if (this.world.tick % 30 === 0) {
-      this.logger.log({
-        event: 'snapshot',
-        tick: this.world.tick,
-        entityCount: state.length
-      });
-    }
-
     for (const session of this.sessions.values()) {
       if (session.ws.readyState !== WebSocket.OPEN) continue;
-      if (session.ws.bufferedAmount > 16384) continue;
+      if (session.ws.bufferedAmount > 65536) continue;
 
       const snapshotBuffer = packSnapshot(session.lastSeq, this.world.tick, state);
       this.sendWithLag(session.ws, snapshotBuffer);
     }
+
+    const elapsed = performance.now() - t0;
+    this.stepSumMs += elapsed;
+    this.stepCount += 1;
+    if (elapsed > this.maxStepMs) {
+      this.maxStepMs = elapsed;
+    }
   }
 
   private sendWithLag(ws: WebSocket, payload: string | ArrayBuffer): void {
+    const byteLen = typeof payload === 'string' ? Buffer.byteLength(payload) : payload.byteLength;
+    metrics.recordOutgoing(byteLen);
+
+    if (config.SIMULATED_LAG_MS <= 0) {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(payload);
+      }
+      return;
+    }
+
     setTimeout(() => {
       if (ws.readyState === WebSocket.OPEN) {
         ws.send(payload);
@@ -274,9 +311,16 @@ export class Room extends EventEmitter<RoomEvents> {
 
   public shutdown(): void {
     this.loop.stop();
-    this.logger.close();
+    const shutdownPayload = JSON.stringify({
+      type: 'shutdown',
+      reason: 'Server shutting down'
+    } satisfies ServerJsonMessage);
+
     for (const session of this.sessions.values()) {
-      session.ws.close(1001, 'Server shutting down');
+      if (session.ws.readyState === WebSocket.OPEN) {
+        session.ws.send(shutdownPayload);
+        session.ws.close(1001, 'Server shutting down');
+      }
     }
     this.sessions.clear();
   }

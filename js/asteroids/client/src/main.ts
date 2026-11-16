@@ -36,6 +36,12 @@ interface TimedSnapshot {
 const FIXED_DT = 1 / 30;
 const INTERPOLATION_DELAY_MS = 90;
 
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    void navigator.serviceWorker.register('/sw.js').catch(() => {});
+  });
+}
+
 function getRequiredElement(id: string): HTMLElement {
   const el = document.getElementById(id);
   if (!(el instanceof HTMLElement)) {
@@ -56,6 +62,7 @@ const ngAgeEl = getRequiredElement('ng-age');
 const ngBpsEl = getRequiredElement('ng-bps');
 const ngQueueEl = getRequiredElement('ng-queue');
 const ngErrEl = getRequiredElement('ng-err');
+const lobbyStatusEl = getRequiredElement('lobby-status');
 const errorOverlayEl = getRequiredElement('error-overlay');
 const errorMessageEl = getRequiredElement('error-message');
 
@@ -63,7 +70,30 @@ const input = createInput();
 const renderer = createRenderer(canvasEl);
 const bounds = renderer.getBounds();
 
+function bindTouchButton(id: string, key: keyof InputKeys): void {
+  const btn = document.getElementById(id);
+  if (!(btn instanceof HTMLElement)) return;
+  const press = (e: Event): void => {
+    e.preventDefault();
+    input.setTouchKey(key, true);
+  };
+  const release = (e: Event): void => {
+    e.preventDefault();
+    input.setTouchKey(key, false);
+  };
+  btn.addEventListener('pointerdown', press);
+  btn.addEventListener('pointerup', release);
+  btn.addEventListener('pointerleave', release);
+  btn.addEventListener('pointercancel', release);
+}
+
+bindTouchButton('touch-left', 'left');
+bindTouchButton('touch-right', 'right');
+bindTouchButton('touch-up', 'up');
+bindTouchButton('touch-fire', 'space');
+
 const world = new World(bounds.width, bounds.height);
+
 export let globalAssets: LoadedAssets | null = null;
 export let deterministicRng: PRNG | null = null;
 
@@ -74,6 +104,8 @@ let myPrevPos = new Vector2(bounds.width / 2, bounds.height / 2);
 let myPrevAngle = -Math.PI / 2;
 let isJoined = false;
 let hasReceivedInitialSpawn = false;
+let rafId: number | null = null;
+let shutdownReason: string | null = null;
 
 let inputSeq: InputSeq = toInputSeq(0);
 let pendingInputs: PendingInput[] = [];
@@ -82,7 +114,6 @@ let localFireCooldown = 0;
 
 const snapshotBuffer: TimedSnapshot[] = [];
 
-// Метрики Netgraph
 let bytesReceived = 0;
 let rttMs = 0;
 const inputSentTimestamps = new Map<InputSeq, number>();
@@ -107,7 +138,36 @@ setInterval(() => {
 const lobby = new Lobby();
 lobby.show();
 
+function returnToLobby(reason: string): void {
+  if (rafId !== null) {
+    cancelAnimationFrame(rafId);
+    rafId = null;
+  }
+
+  isJoined = false;
+  hasReceivedInitialSpawn = false;
+  myPlayerId = null;
+  myShip = null;
+  pendingInputs = [];
+  snapshotBuffer.length = 0;
+  inputSentTimestamps.clear();
+  posError = new Vector2(0, 0);
+  world.entities.clear();
+
+  if (socket !== null) {
+    socket.disconnect();
+    socket = null;
+  }
+
+  gameContainerEl.style.display = 'none';
+  errorOverlayEl.style.display = 'none';
+  lobby.show();
+  lobbyStatusEl.textContent = reason;
+}
+
 lobby.onJoin(({ roomId, playerName }) => {
+  shutdownReason = null;
+  lobbyStatusEl.textContent = '';
   lobby.hide();
   gameContainerEl.style.display = 'block';
   void boot(roomId, playerName);
@@ -115,8 +175,10 @@ lobby.onJoin(({ roomId, playerName }) => {
 
 async function boot(roomId: string, playerName: string): Promise<void> {
   try {
-    globalAssets = await loadAll('/assets/manifest.json', () => {}, new AbortController().signal);
-    initAudio();
+    if (globalAssets === null) {
+      globalAssets = await loadAll('/assets/manifest.json', () => {}, new AbortController().signal);
+      initAudio();
+    }
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const clientSocket = new GameSocket(`${protocol}//${window.location.host}/ws`);
@@ -128,6 +190,11 @@ async function boot(roomId: string, playerName: string): Promise<void> {
       },
       onMessage: (payload: IncomingSocketPayload) => {
         void handleServerPayload(payload);
+      },
+      onClose: () => {
+        const reason =
+          shutdownReason ?? 'Connection to server lost. Returned to lobby.';
+        returnToLobby(reason);
       }
     });
 
@@ -147,7 +214,6 @@ async function handleServerPayload(payload: IncomingSocketPayload): Promise<void
 
     const decoded = unpackSnapshot(buffer);
     if (!decoded.ok) {
-      console.warn(`[Client] Dropped invalid snapshot: ${decoded.error}`);
       return;
     }
 
@@ -167,16 +233,12 @@ async function handleServerPayload(payload: IncomingSocketPayload): Promise<void
       entityMap.set(s.id, s);
 
       if (myPlayerId !== null && s.id === myPlayerId && myShip !== null) {
-        const beforeX = myShip.pos.x;
-        const beforeY = myShip.pos.y;
-
+        const beforePos = myShip.pos;
         myShip.pos = new Vector2(s.x, s.y);
         myShip.vel = new Vector2(s.vx, s.vy);
         myShip.angle = s.a;
 
-        const serverLastSeq = msg.lastSeq;
-        pendingInputs = pendingInputs.filter((inp) => inp.seq > serverLastSeq);
-
+        pendingInputs = pendingInputs.filter((inp) => inp.seq > msg.lastSeq);
         for (const pending of pendingInputs) {
           myShip.applyInput(pending.keys, FIXED_DT);
           myShip.update(FIXED_DT);
@@ -189,14 +251,12 @@ async function handleServerPayload(payload: IncomingSocketPayload): Promise<void
           myPrevAngle = myShip.angle;
           posError = new Vector2(0, 0);
         } else {
-          const dx = beforeX - myShip.pos.x;
-          const dy = beforeY - myShip.pos.y;
-          // Великий стрибок (наприклад, респавн після знищення) застосовуємо одразу
-          if (Math.hypot(dx, dy) > 120) {
+          const delta = beforePos.sub(myShip.pos);
+          if (delta.length() > 120) {
             posError = new Vector2(0, 0);
             myPrevPos = myShip.pos;
           } else {
-            posError = new Vector2(posError.x + dx, posError.y + dy);
+            posError = posError.add(delta);
           }
         }
       }
@@ -211,7 +271,6 @@ async function handleServerPayload(payload: IncomingSocketPayload): Promise<void
 
   const parsed = parseServerJsonMessage(payload.text);
   if (!parsed.ok) {
-    console.warn(`[Client] Invalid server JSON: ${parsed.error}`);
     return;
   }
 
@@ -232,14 +291,18 @@ async function handleServerPayload(payload: IncomingSocketPayload): Promise<void
 
       lastFrameTime = performance.now();
       accumulator = 0;
-      requestAnimationFrame(renderLoop);
+      rafId = requestAnimationFrame(renderLoop);
       break;
     }
     case 'system':
       console.log(`[System] ${msg.text}`);
       break;
     case 'chat':
-      console.log(`[Chat] ${msg.playerName}: ${msg.text}`);
+      console.log(`${msg.playerName}: ${msg.text}`);
+      break;
+    case 'shutdown':
+      shutdownReason = `Server closed: ${msg.reason}`;
+      returnToLobby(shutdownReason);
       break;
     default:
       assertNever(msg);
@@ -247,20 +310,18 @@ async function handleServerPayload(payload: IncomingSocketPayload): Promise<void
 }
 
 function clampShipToBounds(ship: Ship): void {
-  let nx = ship.pos.x;
-  let ny = ship.pos.y;
+  let x = ship.pos.x;
+  let y = ship.pos.y;
   let vx = ship.vel.x;
   let vy = ship.vel.y;
 
-  if (nx < ship.radius) { nx = ship.radius; vx = 0; }
-  if (nx > bounds.width - ship.radius) { nx = bounds.width - ship.radius; vx = 0; }
-  if (ny < ship.radius) { ny = ship.radius; vy = 0; }
-  if (ny > bounds.height - ship.radius) { ny = bounds.height - ship.radius; vy = 0; }
+  if (x < ship.radius) { x = ship.radius; vx = 0; }
+  if (x > bounds.width - ship.radius) { x = bounds.width - ship.radius; vx = 0; }
+  if (y < ship.radius) { y = ship.radius; vy = 0; }
+  if (y > bounds.height - ship.radius) { y = bounds.height - ship.radius; vy = 0; }
 
-  if (nx !== ship.pos.x || ny !== ship.pos.y || vx !== ship.vel.x || vy !== ship.vel.y) {
-    ship.pos = new Vector2(nx, ny);
-    ship.vel = new Vector2(vx, vy);
-  }
+  ship.pos = new Vector2(x, y);
+  ship.vel = new Vector2(vx, vy);
 }
 
 function stepLocalPrediction(): void {
@@ -281,9 +342,8 @@ function stepLocalPrediction(): void {
     playLaserSound();
   }
 
-  const currentInput: PendingInput = { seq: inputSeq, keys };
   socket.sendBinary(packInput(inputSeq, keys));
-  pendingInputs.push(currentInput);
+  pendingInputs.push({ seq: inputSeq, keys });
 
   myShip.applyInput(keys, FIXED_DT);
   myShip.update(FIXED_DT);
@@ -302,7 +362,6 @@ function updateRemoteEntities(now: number): void {
 
   const renderTime = now - INTERPOLATION_DELAY_MS;
 
-  // Видаляємо застарілі знімки, залишаючи принаймні один перед renderTime
   while (snapshotBuffer.length >= 2) {
     const second = snapshotBuffer[1];
     if (second !== undefined && second.receivedAt <= renderTime) {
@@ -373,6 +432,8 @@ function updateRemoteEntities(now: number): void {
 }
 
 function renderLoop(now: number): void {
+  if (!isJoined) return;
+
   const frameDt = Math.min(0.1, (now - lastFrameTime) / 1000);
   lastFrameTime = now;
   accumulator += frameDt;
@@ -386,11 +447,10 @@ function renderLoop(now: number): void {
 
   updateRemoteEntities(now);
 
-  let errX = posError.x * 0.85;
-  let errY = posError.y * 0.85;
-  if (Math.abs(errX) < 0.05) errX = 0;
-  if (Math.abs(errY) < 0.05) errY = 0;
-  posError = new Vector2(errX, errY);
+  posError = posError.scale(0.85);
+  if (posError.length() < 0.05) {
+    posError = new Vector2(0, 0);
+  }
 
   let savedPos: Vector2 | null = null;
   let savedAngle = 0;
@@ -399,12 +459,14 @@ function renderLoop(now: number): void {
     savedPos = myShip.pos;
     savedAngle = myShip.angle;
 
-    const interpX = myPrevPos.x + (savedPos.x - myPrevPos.x) * alpha + posError.x;
-    const interpY = myPrevPos.y + (savedPos.y - myPrevPos.y) * alpha + posError.y;
-    const interpA = interpolateAngle(myPrevAngle, savedAngle, alpha);
+    const interpPos = new Vector2(
+      myPrevPos.x + (savedPos.x - myPrevPos.x) * alpha + posError.x,
+      myPrevPos.y + (savedPos.y - myPrevPos.y) * alpha + posError.y
+    );
+    const interpAngle = interpolateAngle(myPrevAngle, savedAngle, alpha);
 
-    myShip.pos = new Vector2(interpX, interpY);
-    myShip.angle = interpA;
+    myShip.pos = interpPos;
+    myShip.angle = interpAngle;
   }
 
   ngQueueEl.textContent = String(pendingInputs.length);
@@ -417,5 +479,5 @@ function renderLoop(now: number): void {
     myShip.angle = savedAngle;
   }
 
-  requestAnimationFrame(renderLoop);
+  rafId = requestAnimationFrame(renderLoop);
 }
